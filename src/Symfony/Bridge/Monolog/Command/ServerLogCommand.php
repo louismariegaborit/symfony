@@ -20,11 +20,11 @@ use Symfony\Bridge\Monolog\Handler\ConsoleHandler;
 use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Exception\LogicException;
-use Symfony\Component\Console\Exception\RuntimeException;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Output\OutputInterface;
 use Symfony\Component\ExpressionLanguage\ExpressionLanguage;
+use Symfony\Component\VarDumper\Server\DumpServer;
 
 /**
  * @author Grégoire Pineau <lyrixx@lyrixx.info>
@@ -34,8 +34,15 @@ class ServerLogCommand extends Command
 {
     private const BG_COLOR = ['black', 'blue', 'cyan', 'green', 'magenta', 'red', 'white', 'yellow'];
 
-    private ExpressionLanguage $el;
+    private DumpServer $server;
     private HandlerInterface $handler;
+
+    public function __construct(DumpServer $server)
+    {
+        $this->server = $server;
+
+        parent::__construct();
+    }
 
     public function isEnabled(): bool
     {
@@ -78,12 +85,13 @@ EOF
 
     protected function execute(InputInterface $input, OutputInterface $output): int
     {
+        $el = null;
         $filter = $input->getOption('filter');
         if ($filter) {
             if (!class_exists(ExpressionLanguage::class)) {
                 throw new LogicException('Package "symfony/expression-language" is required to use the "filter" option. Try running "composer require symfony/expression-language".');
             }
-            $this->el = new ExpressionLanguage();
+            $el = new ExpressionLanguage();
         }
 
         $this->handler = new ConsoleHandler($output, true, [
@@ -101,49 +109,25 @@ EOF
             $host = 'tcp://'.$host;
         }
 
-        if (!$socket = stream_socket_server($host, $errno, $errstr)) {
-            throw new RuntimeException(sprintf('Server start failed on "%s": ', $host).$errstr.' '.$errno);
-        }
+        $this->server->listen(
+            function (int $clientId, string $message) use ($el, $filter, $output) {
+                $record = unserialize(base64_decode($message));
 
-        foreach ($this->getLogs($socket) as $clientId => $message) {
-            $record = unserialize(base64_decode($message));
+                // Impossible to decode the message, give up.
+                if (false === $record) {
+                    return;
+                }
 
-            // Impossible to decode the message, give up.
-            if (false === $record) {
-                continue;
-            }
+                if ($filter && !$el->evaluate($filter, $record)) {
+                    return;
+                }
 
-            if ($filter && !$this->el->evaluate($filter, $record)) {
-                continue;
-            }
-
-            $this->displayLog($output, $clientId, $record);
-        }
+                $this->displayLog($output, $clientId, $record);
+            },
+            $input,
+        );
 
         return 0;
-    }
-
-    private function getLogs($socket): iterable
-    {
-        $sockets = [(int) $socket => $socket];
-        $write = [];
-
-        while (true) {
-            $read = $sockets;
-            stream_select($read, $write, $write, null);
-
-            foreach ($read as $stream) {
-                if ($socket === $stream) {
-                    $stream = stream_socket_accept($socket);
-                    $sockets[(int) $stream] = $stream;
-                } elseif (feof($stream)) {
-                    unset($sockets[(int) $stream]);
-                    fclose($stream);
-                } else {
-                    yield (int) $stream => fgets($stream);
-                }
-            }
-        }
     }
 
     private function displayLog(OutputInterface $output, int $clientId, array $record): void
